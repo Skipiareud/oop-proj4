@@ -14,6 +14,7 @@ class Song:
     difficulty: float = 1.0  # density multiplier
     length_hint: float = 60.0
     start_delay: float = 2.5  # lead-in seconds
+    chart: Optional[List[Tuple[int, float]]] = None  # optional manual chart (lane, time)
 
 
 @dataclass
@@ -36,6 +37,9 @@ class Track:
         self.color = color
         self.notes: List[Note] = []
         self.last_label: str = "Ready"
+        self.last_label_time: float = 0.0
+        self.last_press: Dict[int, float] = {}
+        self.first_note_time: float = 0.0
         self.score: int = 0
         self.combo: int = 0
 
@@ -44,14 +48,19 @@ class Track:
         self.score = 0
         self.combo = 0
         self.last_label = "Ready"
+        self.last_label_time = 0.0
+        self.last_press = {}
+        self.first_note_time = min((n.time for n in self.notes), default=0.0)
 
     def handle_key(self, key: int, now: float) -> None:
         if key not in self.keys:
             return
         lane = self.keys[key]
+        self.last_press[lane] = now
         note = self._closest_pending_note(lane)
         if note is None:
             self.last_label = "Miss"
+            self.last_label_time = now
             self.combo = 0
             return
         delta = abs(note.time - now)
@@ -62,10 +71,12 @@ class Track:
                 self.score += points + self.combo * 5
                 self.combo += 1
                 self.last_label = label
+                self.last_label_time = now
                 return
         if now > note.time:
             note.missed = True
             self.last_label = "Miss"
+            self.last_label_time = now
             self.combo = 0
 
     def update_misses(self, now: float, drop_after: float = 0.3) -> None:
@@ -73,15 +84,25 @@ class Track:
             if not note.hit and not note.missed and now - note.time > drop_after:
                 note.missed = True
                 self.last_label = "Miss"
+                self.last_label_time = now
                 self.combo = 0
 
     def draw(self, screen: pygame.Surface, now: float, hit_y: float, speed: float) -> None:
         lane_w = self.width // 4
         lane_color = (*[c // 2 for c in self.color], 180)
+        glow_age = now - self.last_label_time
+        glow_strength = max(0.0, 1.0 - glow_age / 0.4)
         for lane in range(4):
             x = self.x + lane * lane_w
             pygame.draw.rect(screen, lane_color, (x + 4, 0, lane_w - 8, screen.get_height()), border_radius=8)
-        pygame.draw.rect(screen, self.color, (self.x, hit_y, self.width, 6), border_radius=3)
+            press_age = now - self.last_press.get(lane, -999)
+            if press_age < 0.18:
+                alpha = int(160 * (1 - press_age / 0.18))
+                overlay = pygame.Surface((lane_w - 8, 26), pygame.SRCALPHA)
+                overlay.fill((*self.color, alpha))
+                screen.blit(overlay, (x + 4, hit_y - 10))
+        base_bar_height = 6 + int(12 * glow_strength)
+        pygame.draw.rect(screen, self.color, (self.x, hit_y, self.width, base_bar_height), border_radius=4)
         for note in self.notes:
             if note.hit or note.missed:
                 continue

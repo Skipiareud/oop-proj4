@@ -1,10 +1,20 @@
+import hashlib
 import random
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 import pygame
 
 from models import Song
+
+
+MIN_FIRST_NOTE = 0.4
+
+
+def stable_seed(key: str) -> int:
+    """Deterministic seed across runs (python hash is salted)."""
+    digest = hashlib.md5(key.encode("utf-8")).hexdigest()
+    return int(digest[:8], 16)
 
 
 class OnsetDetector:
@@ -120,9 +130,9 @@ class ProceduralChartGenerator:
 
     def generate(self, song: Song) -> List[Tuple[int, float]]:
         beat = 60.0 / song.bpm
-        rng = random.Random(abs(hash(song.name)) & 0xFFFFFFFF)
+        rng = random.Random(stable_seed(f"proc:{song.name}:{song.path}:{song.difficulty}"))
         density = max(0.2, min(1.5, song.difficulty))
-        t = beat
+        t = max(MIN_FIRST_NOTE, beat * 1.5)
         chart: List[Tuple[int, float]] = []
         while t < song.length_hint:
             lane = rng.randrange(4)
@@ -137,22 +147,40 @@ class ProceduralChartGenerator:
 
 
 class OnsetChartGenerator:
-    def __init__(self, detector: OnsetDetector, fallback: ProceduralChartGenerator):
+    def __init__(self, detector: OnsetDetector, fallback: ProceduralChartGenerator, allow_onset: bool = True):
         self.detector = detector
         self.fallback = fallback
+        self.allow_onset = allow_onset
+        self.cache: Dict[str, Tuple[List[Tuple[int, float]], str]] = {}
 
     def generate(self, song: Song) -> Tuple[List[Tuple[int, float]], str]:
-        try:
-            onsets = self.detector.detect(song.path)
-        except Exception as exc:
-            print(f"[warn] onset detection failed: {exc}")
-            onsets = []
-        if onsets and len(onsets) >= 5:
-            seed = abs(hash(song.name + song.path)) & 0xFFFFFFFF
-            times = quantize_onsets(onsets, song.bpm)
-            times = [max(0.0, t + song.chart_offset) for t in times]
-            chart = map_onsets_to_lanes(times, seed=seed, difficulty=song.difficulty)
-            end_time = max(t for _, t in chart) if chart else song.length_hint
-            song.length_hint = max(song.length_hint, end_time)
-            return chart, "onset"
-        return self.fallback.generate(song), "procedural"
+        cache_key = f"{song.name}|{song.path}|{song.bpm}|{song.difficulty}|{song.chart_offset}"
+        if cache_key in self.cache:
+            return self.cache[cache_key]
+
+        chart: List[Tuple[int, float]] = []
+        source = "procedural"
+
+        if self.allow_onset:
+            try:
+                onsets = self.detector.detect(song.path)
+            except Exception as exc:
+                print(f"[warn] onset detection failed: {exc}")
+                onsets = []
+            if onsets and len(onsets) >= 5:
+                seed = stable_seed(f"{song.name}:{song.path}")
+                times = quantize_onsets(onsets, song.bpm)
+                times = [max(MIN_FIRST_NOTE, t + song.chart_offset) for t in times]
+                chart = map_onsets_to_lanes(times, seed=seed, difficulty=song.difficulty)
+                source = "onset"
+
+        if not chart:
+            chart = self.fallback.generate(song)
+            source = "procedural"
+
+        chart = [(lane, max(MIN_FIRST_NOTE, t)) for lane, t in chart]
+        chart.sort(key=lambda x: x[1])
+        end_time = max(t for _, t in chart) if chart else song.length_hint
+        song.length_hint = max(song.length_hint, end_time)
+        self.cache[cache_key] = (chart, source)
+        return chart, source
