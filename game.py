@@ -77,7 +77,7 @@ class Game:
         return [
             Song(
                 "Beethoven Virus",
-                "Beethoven Virus.mp3",
+                "songs/Beethoven Virus.mp3",
                 bpm=162,
                 offset=-0.5,
                 chart = [
@@ -340,7 +340,7 @@ class Game:
             ),
             Song(
                 "Small girl (feat. D.O.)",
-                "Small girl.mp3",
+                "songs/Small girl.mp3",
                 bpm=85,
                 offset=0.2,
                 chart=[
