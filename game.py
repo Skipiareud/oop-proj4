@@ -19,17 +19,23 @@ class Game:
         self.font = pygame.font.SysFont("Menlo", 22)
         self.big_font = pygame.font.SysFont("Menlo", 36, bold=True)
         self.label_font = pygame.font.SysFont("Menlo", 26, bold=True)
+
         self.hit_y = self.height - 100
         self.speed = 420
+
         self.tracks = self._make_tracks()
         self.songs = self._load_song_list()
         self.selected_song_idx = 0
+
         self.state = "menu"
         self.audio = AudioPlayer()
         self.song_end: float = 0.0
         self.start_ms: int = pygame.time.get_ticks()
         self.current_song: Optional[Song] = None
+
+        # (예전 ESC 확인용 플래그 – 지금은 안 씀, 남겨만둠)
         self.confirming_exit: bool = False
+
         self.bg_color = (12, 14, 22)
         self.accent_color = (86, 122, 255)
         self.center_line_color = (80, 80, 90)
@@ -39,6 +45,22 @@ class Game:
             "Good": (255, 210, 120),
             "Miss": (255, 120, 120),
         }
+
+        # ---- 일시정지 관련 상태 ----
+        self.is_paused: bool = False               # 완전 정지 상태
+        self.in_resume_countdown: bool = False     # 3초 카운트다운 중인지
+        self.resume_countdown: float = 0.0         # 남은 카운트다운 시간
+        self.pause_tick_ms: int = 0                # pause 시작 tick
+        self.paused_raw_now: float = 0.0           # pause 시점의 raw_now
+        self.resume_start_ms: int = 0              # 카운트다운 시작 tick
+
+        # ---- 콤보 공격 관련 ----
+        self.combo_damage: int = 500               # 콤보 공격 시 깎을 점수
+        self.prev_combos = [0, 0]                  # 직전 프레임 콤보값
+
+        # 콤보 공격 이펙트용
+        self.last_combo_attack_time: float = -1.0
+        self.last_combo_attack_player: Optional[int] = None
 
     def _make_tracks(self) -> Tuple[Track, Track]:
         half = self.width // 2
@@ -64,7 +86,7 @@ class Game:
                     (3, 74.956),         (1, 85.214),         (0, 87.034),         (1, 88.523),         (2, 88.853),         (2, 89.515),         (1, 89.846),         (2, 90.177),         (1, 91.335),         (3, 91.501),
                     (1, 91.997),         (1, 92.328),         (2, 92.659),         (1, 93.32),         (2, 93.486),         (3, 94.313),         (2, 96.298),         (1, 96.795),         (1, 96.96),         (2, 99.607),
                     (1, 100.6),         (2, 100.931),         (2, 101.593),         (1, 101.923),         (2, 102.089),         (2, 102.42),         (3, 102.751),         (2, 103.081),         (2, 103.743),         (2, 104.24),
-                    (2, 104.901),         (1, 105.232),         (2, 106.059),         (2, 106.887),         (2, 107.383),         (3, 107.548),         (0, 111.684) 
+                    (2, 104.901),         (1, 105.232),         (2, 106.059),         (2, 106.887),         (2, 107.383),         (3, 107.548),         (0, 111.684)
                 ]
             ),
             Song(
@@ -167,7 +189,7 @@ class Game:
                     (0, 96.889), (1, 97.259), (3, 97.815), (2, 98.278), (2, 98.463),
 
                     (2, 98.741), (3, 99.019), (2, 99.111), (0, 99.296)
-                ], 
+                ],
                 length_hint=102.5,
                 start_delay=2.5,
             ),
@@ -316,8 +338,6 @@ class Game:
                 start_delay=2.5,
             ),
         ]
-    
-
 
     #  ---- State transitions ----
     def _start_song(self, song: Song) -> None:
@@ -325,60 +345,105 @@ class Game:
         if not chart:
             print(f"[warn] chart is empty for '{song.name}'. Add (lane, time) tuples to Song.chart.")
         chart.sort(key=lambda x: x[1])
+
         for track in self.tracks:
             track.load_chart(chart)
+
         self.song_end = (max(time for _, time in chart) if chart else song.length_hint) + 4.0
         self.start_ms = pygame.time.get_ticks()
         self.audio.queue(song.path, song.start_delay)
         self.state = "play"
-        self.confirming_exit = False
         self.current_song = song
+
+        # pause / combo 상태 리셋
+        self.is_paused = False
+        self.in_resume_countdown = False
+        self.resume_countdown = 0.0
+        self.prev_combos = [0, 0]
+        self.last_combo_attack_time = -1.0
+        self.last_combo_attack_player = None
 
     def _back_to_menu(self) -> None:
         self.state = "menu"
         self.audio.stop()
-        self.confirming_exit = False
+        self.is_paused = False
+        self.in_resume_countdown = False
+        self.resume_countdown = 0.0
+        self.last_combo_attack_time = -1.0
+        self.last_combo_attack_player = None
 
     # ---- Main loop ----
     def run(self) -> None:
         running = True
         while running:
             tick_now = pygame.time.get_ticks()
-            raw_now = (tick_now - self.start_ms) / 1000.0
-            start_delay = self.current_song.start_delay if self.state == "play" and self.current_song else 0.0
-            now = max(0.0, raw_now - start_delay)
+
+            # 시간 계산 (pause / countdown 중이면 시간 멈춤)
+            if self.state == "play" and self.current_song:
+                if self.is_paused or self.in_resume_countdown:
+                    raw_now = self.paused_raw_now
+                else:
+                    raw_now = (tick_now - self.start_ms) / 1000.0
+                start_delay = self.current_song.start_delay
+                now = max(0.0, raw_now - start_delay)
+            else:
+                raw_now = 0.0
+                now = 0.0
+
+            # 이벤트 처리
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     running = False
                 elif event.type == pygame.KEYDOWN:
                     running = self._handle_key(event.key, now)
 
-            if self.state == "play":
-                self.audio.tick()
-                if not self.confirming_exit:
+            # 상태 업데이트 & 그리기
+            if self.state == "play" and self.current_song:
+                # 재개 카운트다운 처리
+                if self.in_resume_countdown:
+                    elapsed = (tick_now - self.resume_start_ms) / 1000.0
+                    self.resume_countdown = max(0.0, 3.0 - elapsed)
+                    if self.resume_countdown <= 0.0:
+                        # 카운트다운 끝 → 실제 시간 보정 후 재개
+                        self.in_resume_countdown = False
+                        self.is_paused = False
+                        delta_ms = tick_now - self.pause_tick_ms
+                        self.start_ms += delta_ms
+                        try:
+                            pygame.mixer.music.unpause()
+                        except pygame.error:
+                            pass
+
+                # 실제 플레이 진행은 pause / countdown 아닐 때만
+                if not self.is_paused and not self.in_resume_countdown:
+                    self.audio.tick()
                     for track in self.tracks:
                         track.update_misses(now)
+                    self._update_combo_attacks(now)
+
                 self._draw_play(now, raw_now)
-                if not self.confirming_exit and now > self.song_end and all(t.finished() for t in self.tracks):
+
+                # 게임 종료 판정도 진행 중일 때만
+                if (
+                    not self.is_paused
+                    and not self.in_resume_countdown
+                    and now > self.song_end
+                    and all(t.finished() for t in self.tracks)
+                ):
                     self._draw_game_over()
                     pygame.display.flip()
                     self._wait_for_restart()
                     self._back_to_menu()
             else:
                 self._draw_menu()
+
             pygame.display.flip()
             self.clock.tick(60)
         pygame.quit()
 
     # ---- Input ----
     def _handle_key(self, key: int, now: float) -> bool:
-        if self.confirming_exit:
-            if key in (pygame.K_y, pygame.K_RETURN):
-                self._back_to_menu()
-            elif key in (pygame.K_n, pygame.K_ESCAPE, pygame.K_SPACE):
-                self.confirming_exit = False
-            return True
-
+        # 메뉴
         if self.state == "menu":
             if key == pygame.K_ESCAPE:
                 return False
@@ -391,16 +456,75 @@ class Game:
                 self._start_song(song)
             return True
 
-        # playing state
-        if key == pygame.K_ESCAPE:
-            self.confirming_exit = True
+        # 플레이 중일 때 (state == "play")
+        if self.state == "play":
+            # 일시정지/카운트다운 상태에서의 입력
+            if self.is_paused or self.in_resume_countdown:
+                if key in (pygame.K_RETURN, pygame.K_SPACE):
+                    # 일시정지 중 Enter/Space → 3초 카운트다운 시작
+                    if self.is_paused and not self.in_resume_countdown:
+                        self.in_resume_countdown = True
+                        self.resume_start_ms = pygame.time.get_ticks()
+                        self.resume_countdown = 3.0
+                    return True
+                if key == pygame.K_ESCAPE:
+                    # 일시정지 상태에서 ESC → 메뉴로
+                    self._back_to_menu()
+                    return True
+                if key == pygame.K_b:
+                    # 일시정지 상태에서 B → 곡 재시작
+                    self._start_song(self.current_song)
+                    return True
+                return True
+
+            # 여기부터는 정상 플레이 중
+            if key == pygame.K_ESCAPE:
+                # ESC → 일시정지 진입
+                self._enter_pause()
+                return True
+            if key == pygame.K_b:
+                # 곡 재시작
+                self._start_song(self.current_song)
+                return True
+
+            for track in self.tracks:
+                track.handle_key(key, now)
             return True
-        if key == pygame.K_b:
-            self._start_song(self.current_song)
-            return True
-        for track in self.tracks:
-            track.handle_key(key, now)
+
         return True
+
+    def _enter_pause(self) -> None:
+        """ESC 눌렀을 때 호출: 게임/음악 일시정지."""
+        if self.is_paused:
+            return
+        self.is_paused = True
+        self.in_resume_countdown = False
+        self.resume_countdown = 0.0
+        self.pause_tick_ms = pygame.time.get_ticks()
+        self.paused_raw_now = (self.pause_tick_ms - self.start_ms) / 1000.0
+        try:
+            pygame.mixer.music.pause()
+        except pygame.error:
+            pass
+
+    # ---- Combo 공격 로직 ----
+    def _update_combo_attacks(self, now: float) -> None:
+        """콤보가 5,10,15,...에 도달할 때마다 상대 점수를 깎고 이펙트."""
+        for i, track in enumerate(self.tracks):
+            combo = track.combo
+            prev = self.prev_combos[i]
+            if combo != prev:
+                if combo > prev and combo > 0 and combo % 5 == 0:
+                    other = self.tracks[1 - i]
+                    # 점수 감소
+                    other.score = max(0, other.score - self.combo_damage)
+                    # 맞은 쪽에 -500 판정처럼 표시
+                    other.last_label = f"-{self.combo_damage}"
+                    other.last_label_time = now
+                    # 이펙트 정보 기록 (공격한 플레이어 인덱스)
+                    self.last_combo_attack_time = now
+                    self.last_combo_attack_player = i
+                self.prev_combos[i] = combo
 
     # ---- Drawing ----
     def _draw_menu(self) -> None:
@@ -408,7 +532,9 @@ class Game:
         title = self.big_font.render("Two Player Rhythm Battle", True, (240, 240, 240))
         self.screen.blit(title, (self.width // 2 - title.get_width() // 2, 40))
         info_lines = [
-            "Controls: P1=QWER, P2=OP[], Up/Down to choose, Esc=quit app",
+            "Controls: P1=QWER, P2=OP[], Up/Down to choose",
+            "In game: B=restart, Esc=pause",
+            "Paused: Enter/Space=resume (3s), B=restart, Esc=menu",
         ]
         y = 120
         for line in info_lines:
@@ -430,12 +556,21 @@ class Game:
             track.draw(self.screen, now, self.hit_y, self.speed)
         self._draw_center_divider()
         self._draw_ui(now)
+
+        # 곡 시작 전 리드인 카운트다운 (일시정지 중에는 표시 안 함)
         lead = self.current_song.start_delay if self.current_song else 0
         remain = lead - raw_now if raw_now < lead else 0
-        if remain > 0 and not self.confirming_exit:
+        if remain > 0 and not self.is_paused and not self.in_resume_countdown:
             self._draw_countdown(remain)
-        if self.confirming_exit:
-            self._draw_exit_confirm()
+
+        # 콤보 공격 이펙트
+        self._draw_combo_effect(now)
+
+        # Pause / Resume 카운트다운 오버레이
+        if self.is_paused and not self.in_resume_countdown:
+            self._draw_pause_menu()
+        if self.in_resume_countdown:
+            self._draw_countdown(self.resume_countdown)
 
     def _draw_background(self) -> None:
         self.screen.fill(self.bg_color)
@@ -512,7 +647,7 @@ class Game:
         self.screen.blit(surf, (x, y))
 
     def _draw_footer(self, now: float) -> None:
-        info_text = "B: restart | Esc: quit song"
+        info_text = "B: restart | Esc: pause"
         info_surf = self.font.render(info_text, True, (205, 205, 205))
         info_x = self.width // 2 - info_surf.get_width() // 2
         info_y = 98
@@ -530,20 +665,52 @@ class Game:
         rect = text.get_rect(center=(self.width // 2, self.height // 2))
         self.screen.blit(text, rect)
 
-    def _draw_exit_confirm(self) -> None:
+    def _draw_pause_menu(self) -> None:
         overlay = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
         overlay.fill((0, 0, 0, 180))
         self.screen.blit(overlay, (0, 0))
         lines = [
-            "Quit this song and return to menu?",
-            "Y/Enter: Yes   N/Esc: No",
+            "Paused",
+            "Enter/Space: resume (3s countdown)",
+            "B: restart song",
+            "Esc: back to menu",
         ]
-        y = self.height // 2 - 20
+        y = self.height // 2 - 40
         for line in lines:
             surf = self.big_font.render(line, True, (240, 240, 240))
             rect = surf.get_rect(center=(self.width // 2, y))
             self.screen.blit(surf, rect)
-            y += 48
+            y += 44
+
+    def _draw_combo_effect(self, now: float) -> None:
+        """콤보 공격 시 맞은 쪽 화면 붉게 번쩍 + COMBO HIT! 텍스트."""
+        if self.last_combo_attack_time < 0 or self.last_combo_attack_player is None:
+            return
+        age = now - self.last_combo_attack_time
+        duration = 0.35
+        if age < 0 or age > duration:
+            return
+
+        t = age / duration
+        alpha = int(180 * (1.0 - t))
+        if alpha <= 0:
+            return
+
+        attacker = self.last_combo_attack_player
+        victim_idx = 1 - attacker
+        victim_track = self.tracks[victim_idx]
+
+        # 맞은 쪽 레인 전체 붉은 오버레이
+        overlay = pygame.Surface((victim_track.width, self.height), pygame.SRCALPHA)
+        overlay.fill((255, 80, 80, alpha))
+        self.screen.blit(overlay, (victim_track.x, 0))
+
+        # 중앙에 "COMBO HIT!" 텍스트
+        text = self.big_font.render("COMBO HIT!", True, (255, 255, 255))
+        text.set_alpha(alpha)
+        cx = victim_track.x + victim_track.width // 2 - text.get_width() // 2
+        cy = self.height // 2 - text.get_height() // 2
+        self.screen.blit(text, (cx, cy))
 
     def _draw_game_over(self) -> None:
         overlay = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
