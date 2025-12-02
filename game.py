@@ -32,6 +32,7 @@ class Game:
         self.song_end: float = 0.0
         self.start_ms: int = pygame.time.get_ticks()
         self.current_song: Optional[Song] = None
+        self.just_started: bool = False
 
         # (예전 ESC 확인용 플래그 – 지금은 안 씀, 남겨만둠)
         self.confirming_exit: bool = False
@@ -334,8 +335,7 @@ class Game:
 
                 ],
                 length_hint=102.5,
-                
-                tart_delay=2.5,
+                start_delay=2.5,
             ),
             Song(
                 "Small girl (feat. D.O.)",
@@ -498,11 +498,15 @@ class Game:
         self.audio.queue(song.path, song.start_delay)
         self.state = "play"
         self.current_song = song
+        self.just_started = True
 
         # pause / combo 상태 리셋
         self.is_paused = False
         self.in_resume_countdown = False
         self.resume_countdown = 0.0
+        self.pause_tick_ms = 0
+        self.paused_raw_now = 0.0
+        self.resume_start_ms = 0
         self.prev_combos = [0, 0]
         self.last_combo_attack_time = -1.0
         self.last_combo_attack_player = None
@@ -510,9 +514,13 @@ class Game:
     def _back_to_menu(self) -> None:
         self.state = "menu"
         self.audio.stop()
+        self.current_song = None
         self.is_paused = False
         self.in_resume_countdown = False
         self.resume_countdown = 0.0
+        self.pause_tick_ms = 0
+        self.paused_raw_now = 0.0
+        self.resume_start_ms = 0
         self.last_combo_attack_time = -1.0
         self.last_combo_attack_player = None
 
@@ -533,6 +541,7 @@ class Game:
             else:
                 raw_now = 0.0
                 now = 0.0
+            skip_updates = False
 
             # 이벤트 처리
             for event in pygame.event.get():
@@ -540,6 +549,14 @@ class Game:
                     running = False
                 elif event.type == pygame.KEYDOWN:
                     running = self._handle_key(event.key, now)
+
+            # 재시작 직후 첫 프레임: 시간/업데이트 초기화
+            if self.just_started:
+                tick_now = pygame.time.get_ticks()
+                raw_now = 0.0
+                now = 0.0
+                skip_updates = True
+                self.just_started = False
 
             # 상태 업데이트 & 그리기
             if self.state == "play" and self.current_song:
@@ -559,7 +576,7 @@ class Game:
                             pass
 
                 # 실제 플레이 진행은 pause / countdown 아닐 때만
-                if not self.is_paused and not self.in_resume_countdown:
+                if not self.is_paused and not self.in_resume_countdown and not skip_updates:
                     self.audio.tick()
                     for track in self.tracks:
                         track.update_misses(now)
