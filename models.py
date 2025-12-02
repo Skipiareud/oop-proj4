@@ -35,6 +35,10 @@ class Track:
         self.width = width
         self.keys = keys
         self.color = color
+        self.max_health: float = 100.0
+        self.health: float = self.max_health
+        self.is_down: bool = False
+        self.just_downed: bool = False
         self.notes: List[Note] = []
         self.last_label: str = "Ready"
         self.last_label_time: float = 0.0
@@ -51,10 +55,29 @@ class Track:
         self.last_label_time = 0.0
         self.last_press = {}
         self.first_note_time = min((n.time for n in self.notes), default=0.0)
+        self.health = self.max_health
+        self.is_down = False
+        self.just_downed = False
 
-    def handle_key(self, key: int, now: float) -> None:
-        if key not in self.keys:
+    def heal(self, amount: float) -> None:
+        if self.is_down:
             return
+        self.health = min(self.max_health, self.health + amount)
+
+    def damage(self, amount: float) -> None:
+        if self.health <= 0:
+            return
+        prev = self.health
+        self.health = max(0.0, self.health - amount)
+        if self.health <= 0 and prev > 0:
+            self.is_down = True
+            self.just_downed = True
+
+    def handle_key(self, key: int, now: float) -> Optional[str]:
+        if self.is_down:
+            return None
+        if key not in self.keys:
+            return None
         lane = self.keys[key]
         self.last_press[lane] = now
         note = self._closest_pending_note(lane)
@@ -62,30 +85,53 @@ class Track:
             self.last_label = "Miss"
             self.last_label_time = now
             self.combo = 0
-            return
+            return "Miss"
         delta = abs(note.time - now)
-        windows = [(0.08, "Perfect", 1000), (0.16, "Great", 700), (0.25, "Good", 400)]
-        for limit, label, points in windows:
+        windows = [
+            (0.08, "Perfect", 1000, True),
+            (0.16, "Great", 700, True),
+            (0.24, "Good", 400, True),
+            (0.32, "Bad", 100, False),
+        ]
+        for limit, label, points, keep_combo in windows:
             if delta <= limit:
                 note.hit = True
-                self.score += points + self.combo * 5
-                self.combo += 1
+                if keep_combo:
+                    bonus = min(self.combo * 8, 400)
+                    self.score += points + bonus
+                    self.combo += 1
+                else:
+                    self.score += points
+                    self.combo = 0
                 self.last_label = label
                 self.last_label_time = now
-                return
+                return label
+        # 약간 일찍 눌렀을 때도 Bad 처리하여 콤보를 끊음
+        if now < note.time and (note.time - now) <= 0.35:
+            note.hit = True
+            self.last_label = "Bad"
+            self.last_label_time = now
+            self.score += 100
+            self.combo = 0
+            return "Bad"
         if now > note.time:
             note.missed = True
             self.last_label = "Miss"
             self.last_label_time = now
             self.combo = 0
+            return "Miss"
+        return None
 
-    def update_misses(self, now: float, drop_after: float = 0.3) -> None:
+    def update_misses(self, now: float, drop_after: float = 0.3) -> int:
+        missed = 0
         for note in self.notes:
             if not note.hit and not note.missed and now - note.time > drop_after:
                 note.missed = True
                 self.last_label = "Miss"
                 self.last_label_time = now
                 self.combo = 0
+                missed += 1
+        return missed
 
     def draw(self, screen: pygame.Surface, now: float, hit_y: float, speed: float) -> None:
         lane_w = self.width // 4

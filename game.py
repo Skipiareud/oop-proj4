@@ -12,15 +12,17 @@ MIN_FIRST_NOTE = 0.4  # clamp first note a bit after lead-in
 class Game:
     def __init__(self) -> None:
         pygame.init()
-        self.width, self.height = 960, 540
+        self.width, self.height = 1440, 810
         self.screen = pygame.display.set_mode((self.width, self.height))
         pygame.display.set_caption("Two Player Rhythm Battle")
         self.clock = pygame.time.Clock()
         self.font = pygame.font.SysFont("Menlo", 22)
         self.big_font = pygame.font.SysFont("Menlo", 36, bold=True)
         self.label_font = pygame.font.SysFont("Menlo", 26, bold=True)
+        self.menu_font = pygame.font.SysFont("Menlo", 26)
+        self.menu_big_font = pygame.font.SysFont("Menlo", 44, bold=True)
 
-        self.hit_y = self.height - 100
+        self.hit_y = self.height - 150
         self.speed = 420
 
         self.tracks = self._make_tracks()
@@ -33,6 +35,9 @@ class Game:
         self.start_ms: int = pygame.time.get_ticks()
         self.current_song: Optional[Song] = None
         self.just_started: bool = False
+        self.play_mode: str = "sudden"
+        self.game_modes = [("sudden", "Sudden KO"), ("endurance", "Endurance")]
+        self.selected_mode_idx: int = 0
 
         # (예전 ESC 확인용 플래그 – 지금은 안 씀, 남겨만둠)
         self.confirming_exit: bool = False
@@ -55,11 +60,7 @@ class Game:
         self.paused_raw_now: float = 0.0           # pause 시점의 raw_now
         self.resume_start_ms: int = 0              # 카운트다운 시작 tick
 
-        # ---- 콤보 공격 관련 ----
-        self.combo_damage: int = 500               # 콤보 공격 시 깎을 점수
-        self.prev_combos = [0, 0]                  # 직전 프레임 콤보값
-
-        # 콤보 공격 이펙트용
+        # 공격/피격 이펙트용
         self.last_combo_attack_time: float = -1.0
         self.last_combo_attack_player: Optional[int] = None
 
@@ -339,11 +340,11 @@ class Game:
             ),
             Song(
                 "Small girl (feat. D.O.)",
-                "이영지 - Small girl (feat. 도경수(D.O.).mp3",
-                bpm=96,
-                offset=0.0,
+                "Small girl.mp3",
+                bpm=85,
+                offset=0.2,
                 chart=[
-                    (2, 0.765), (2, 1.029), (3, 1.118), (2, 1.912), (3, 2.088),
+                    (2, 0.765), (2, 1.912), (3, 2.088),
                     (0, 2.176), (1, 2.529), (2, 3.588), (1, 4.294), (1, 4.559),
 
                     (3, 5.0), (3, 5.618), (2, 5.706), (1, 6.059), (0, 6.324),
@@ -499,6 +500,7 @@ class Game:
         self.state = "play"
         self.current_song = song
         self.just_started = True
+        self.play_mode = self.game_modes[self.selected_mode_idx][0]
 
         # pause / combo 상태 리셋
         self.is_paused = False
@@ -507,7 +509,6 @@ class Game:
         self.pause_tick_ms = 0
         self.paused_raw_now = 0.0
         self.resume_start_ms = 0
-        self.prev_combos = [0, 0]
         self.last_combo_attack_time = -1.0
         self.last_combo_attack_player = None
 
@@ -578,9 +579,13 @@ class Game:
                 # 실제 플레이 진행은 pause / countdown 아닐 때만
                 if not self.is_paused and not self.in_resume_countdown and not skip_updates:
                     self.audio.tick()
-                    for track in self.tracks:
-                        track.update_misses(now)
-                    self._update_combo_attacks(now)
+                    for idx, track in enumerate(self.tracks):
+                        missed = track.update_misses(now)
+                        if missed and not track.is_down:
+                            self._apply_health(idx, "Miss", repeat=missed, now=now)
+                self._check_deaths(now)
+                if self.state != "play" or self.current_song is None:
+                    continue
 
                 self._draw_play(now, raw_now)
 
@@ -612,6 +617,10 @@ class Game:
                 self.selected_song_idx = (self.selected_song_idx - 1) % len(self.songs)
             elif key == pygame.K_DOWN:
                 self.selected_song_idx = (self.selected_song_idx + 1) % len(self.songs)
+            elif key == pygame.K_LEFT:
+                self.selected_mode_idx = (self.selected_mode_idx - 1) % len(self.game_modes)
+            elif key == pygame.K_RIGHT:
+                self.selected_mode_idx = (self.selected_mode_idx + 1) % len(self.game_modes)
             elif key in (pygame.K_RETURN, pygame.K_SPACE):
                 song = self.songs[self.selected_song_idx]
                 self._start_song(song)
@@ -648,8 +657,12 @@ class Game:
                 self._start_song(self.current_song)
                 return True
 
-            for track in self.tracks:
-                track.handle_key(key, now)
+            for idx, track in enumerate(self.tracks):
+                if track.is_down:
+                    continue
+                label = track.handle_key(key, now)
+                if label:
+                    self._apply_health(idx, label, now=now)
             return True
 
         return True
@@ -668,48 +681,88 @@ class Game:
         except pygame.error:
             pass
 
-    # ---- Combo 공격 로직 ----
-    def _update_combo_attacks(self, now: float) -> None:
-        """콤보가 5,10,15,...에 도달할 때마다 상대 점수를 깎고 이펙트."""
+    # ---- HP / 판정 효과 ----
+    def _apply_health(self, actor_idx: int, label: str, repeat: int = 1, now: float = 0.0) -> None:
+        actor = self.tracks[actor_idx]
+        if actor.is_down:
+            return
+        victim = self.tracks[1 - actor_idx]
+
+        for _ in range(repeat):
+            if label == "Perfect":
+                actor.heal(1.5)
+            elif label == "Great":
+                actor.heal(1.0)
+            elif label == "Good":
+                actor.heal(0.6)
+            elif label == "Bad":
+                actor.damage(2.0)
+            elif label == "Miss":
+                actor.damage(5.0)
+
+        # 콤보에 따른 상대 체력 감소/내 체력 회복
+        if label in ("Perfect", "Great", "Good") and actor.combo > 0 and actor.combo % 5 == 0:
+            victim.damage(4.0)
+            actor.heal(3.0)
+            self.last_combo_attack_time = now
+            self.last_combo_attack_player = actor_idx
+
+    def _check_deaths(self, now: float) -> None:
+        if self.state != "play":
+            return
         for i, track in enumerate(self.tracks):
-            combo = track.combo
-            prev = self.prev_combos[i]
-            if combo != prev:
-                if combo > prev and combo > 0 and combo % 5 == 0:
-                    other = self.tracks[1 - i]
-                    # 점수 감소
-                    other.score = max(0, other.score - self.combo_damage)
-                    # 맞은 쪽에 -500 판정처럼 표시
-                    other.last_label = f"-{self.combo_damage}"
-                    other.last_label_time = now
-                    # 이펙트 정보 기록 (공격한 플레이어 인덱스)
-                    self.last_combo_attack_time = now
-                    self.last_combo_attack_player = i
-                self.prev_combos[i] = combo
+            if not track.just_downed and track.health > 0:
+                continue
+            # 다운 처리
+            track.is_down = True
+            track.just_downed = False
+            track.combo = 0
+            track.last_label = "KO"
+            track.last_label_time = now
+            if self.play_mode == "sudden":
+                winner_idx = 1 - i if self.tracks[1 - i].health > 0 else None
+                self._handle_ko(winner_idx)
+                return
+
+    def _handle_ko(self, winner_idx: Optional[int]) -> None:
+        try:
+            pygame.mixer.music.stop()
+        except pygame.error:
+            pass
+        self._draw_ko_overlay(winner_idx)
+        pygame.display.flip()
+        self._wait_for_restart()
+        if self.state != "play":
+            self._back_to_menu()
 
     # ---- Drawing ----
     def _draw_menu(self) -> None:
         self.screen.fill((18, 18, 24))
-        title = self.big_font.render("Two Player Rhythm Battle", True, (240, 240, 240))
-        self.screen.blit(title, (self.width // 2 - title.get_width() // 2, 40))
+        title = self.menu_big_font.render("Two Player Rhythm Battle", True, (240, 240, 240))
+        self.screen.blit(title, (self.width // 2 - title.get_width() // 2, 48))
         info_lines = [
             "Controls: P1=QWER, P2=OP[], Up/Down to choose",
             "In game: B=restart, Esc=pause",
             "Paused: Enter/Space=resume (3s), B=restart, Esc=menu",
+            "Left/Right: change mode (Sudden KO / Endurance)",
         ]
-        y = 120
+        y = 150
         for line in info_lines:
-            surf = self.font.render(line, True, (210, 210, 210))
-            self.screen.blit(surf, (60, y))
-            y += 28
+            surf = self.menu_font.render(line, True, (210, 210, 210))
+            self.screen.blit(surf, (70, y))
+            y += 32
         y += 8
         for idx, song in enumerate(self.songs):
             color = (255, 230, 150) if idx == self.selected_song_idx else (190, 190, 190)
             prefix = "➤ " if idx == self.selected_song_idx else "  "
             label = f"{prefix}{song.name} (bpm {song.bpm}, diff {song.difficulty:.1f})"
-            surf = self.font.render(label, True, color)
-            self.screen.blit(surf, (80, y))
-            y += 30
+            surf = self.menu_font.render(label, True, color)
+            self.screen.blit(surf, (90, y))
+            y += 36
+        mode_code, mode_label = self.game_modes[self.selected_mode_idx]
+        mode_text = f"Mode: {mode_label} ({'stop on KO' if mode_code=='sudden' else 'play to end'})"
+        mode_surf = self.menu_font.render(mode_text, True, (220, 220, 220))
+        self.screen.blit(mode_surf, (70, y + 12))
 
     def _draw_play(self, now: float, raw_now: float) -> None:
         self._draw_background()
@@ -742,8 +795,9 @@ class Game:
         tint_right.fill((*self.tracks[1].color, 26))
         self.screen.blit(tint_left, (0, 0))
         self.screen.blit(tint_right, (half, 0))
-        band = pygame.Surface((self.width, 140), pygame.SRCALPHA)
-        pygame.draw.rect(band, (255, 255, 255, 18), (0, 0, self.width, 140), border_radius=18)
+        band_height = 170
+        band = pygame.Surface((self.width, band_height), pygame.SRCALPHA)
+        pygame.draw.rect(band, (255, 255, 255, 18), (0, 0, self.width, band_height), border_radius=18)
         self.screen.blit(band, (0, 0))
         grid = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
         for y in range(0, self.height, 36):
@@ -765,7 +819,7 @@ class Game:
         self._draw_footer(now)
 
     def _draw_track_panel(self, track: Track) -> None:
-        panel_rect = pygame.Rect(track.x + 16, 16, track.width - 32, 72)
+        panel_rect = pygame.Rect(track.x + 16, 16, track.width - 32, 140)
         pygame.draw.rect(self.screen, (*track.color, 70), panel_rect, border_radius=14)
         pygame.draw.rect(self.screen, (*track.color, 120), panel_rect, width=2, border_radius=14)
         name_surf = self.label_font.render(track.name, True, (245, 245, 245))
@@ -777,16 +831,35 @@ class Game:
             if lane < len(lane_keys):
                 lane_keys[lane] = label
         keys_surf = self.font.render(" ".join(lane_keys), True, (210, 210, 210))
-        self.screen.blit(name_surf, (panel_rect.x + 14, panel_rect.y + 6))
-        self.screen.blit(score_surf, (panel_rect.x + 14, panel_rect.y + 36))
-        self.screen.blit(combo_surf, (panel_rect.x + panel_rect.width // 2, panel_rect.y + 36))
-        self.screen.blit(keys_surf, (panel_rect.right - keys_surf.get_width() - 14, panel_rect.y + 6))
-        pygame.draw.rect(
-            self.screen,
-            (*track.color, 160),
-            (panel_rect.x + 12, panel_rect.bottom - 10, min(panel_rect.width - 24, 160), 4),
-            border_radius=2,
-        )
+
+        top_y = panel_rect.y + 12
+        self.screen.blit(name_surf, (panel_rect.x + 14, top_y))
+        self.screen.blit(keys_surf, (panel_rect.right - keys_surf.get_width() - 14, top_y))
+
+        mid_y = panel_rect.y + 62
+        self.screen.blit(score_surf, (panel_rect.x + 14, mid_y))
+        self.screen.blit(combo_surf, (panel_rect.right - combo_surf.get_width() - 14, mid_y))
+
+        self._draw_health_bar(track, panel_rect)
+        if track.is_down:
+            down_surf = self.font.render("DOWN", True, (255, 120, 120))
+            self.screen.blit(down_surf, (panel_rect.right - down_surf.get_width() - 14, panel_rect.y + 96))
+
+    def _draw_health_bar(self, track: Track, panel_rect: pygame.Rect) -> None:
+        hp_pct = max(0.0, min(1.0, track.health / track.max_health))
+        bar_rect = pygame.Rect(panel_rect.x + 14, panel_rect.y + panel_rect.height - 30, panel_rect.width - 28, 12)
+        pygame.draw.rect(self.screen, (30, 30, 40), bar_rect, border_radius=4)
+        fill_w = int(bar_rect.width * hp_pct)
+        if fill_w > 0:
+            hp_color = (
+                int(230 - 150 * hp_pct),
+                int(80 + 120 * hp_pct),
+                int(90 + 40 * hp_pct),
+            )
+            pygame.draw.rect(self.screen, hp_color, (bar_rect.x, bar_rect.y, fill_w, bar_rect.height), border_radius=4)
+        pygame.draw.rect(self.screen, (*track.color, 140), bar_rect, width=2, border_radius=4)
+        hp_text = self.font.render(f"HP {int(track.health)}/{int(track.max_health)}", True, (235, 235, 235))
+        self.screen.blit(hp_text, (bar_rect.x, bar_rect.y - 20))
 
     def _draw_judgement(self, track: Track, now: float) -> None:
         if track.last_label_time <= 0:
@@ -811,7 +884,7 @@ class Game:
         info_text = "B: restart | Esc: pause"
         info_surf = self.font.render(info_text, True, (205, 205, 205))
         info_x = self.width // 2 - info_surf.get_width() // 2
-        info_y = 98
+        info_y = self.height - 48
         self.screen.blit(info_surf, (info_x, info_y))
         timer_surf = self.font.render(f"{now:05.2f}s", True, (215, 215, 215))
         timer_x = self.width // 2 - timer_surf.get_width() // 2
@@ -866,8 +939,8 @@ class Game:
         overlay.fill((255, 80, 80, alpha))
         self.screen.blit(overlay, (victim_track.x, 0))
 
-        # 중앙에 "COMBO HIT!" 텍스트
-        text = self.big_font.render("COMBO HIT!", True, (255, 255, 255))
+        # 중앙에 HP 이펙트 텍스트
+        text = self.big_font.render("HP DRAIN!", True, (255, 255, 255))
         text.set_alpha(alpha)
         cx = victim_track.x + victim_track.width // 2 - text.get_width() // 2
         cy = self.height // 2 - text.get_height() // 2
@@ -878,11 +951,22 @@ class Game:
         overlay.fill((0, 0, 0, 160))
         self.screen.blit(overlay, (0, 0))
         p1, p2 = self.tracks
-        winner = "Draw" if p1.score == p2.score else ("Player 1" if p1.score > p2.score else "Player 2")
+        both_alive = p1.health > 0 and p2.health > 0
+        if self.play_mode == "endurance" and both_alive:
+            title = "Clear!"
+            winner = None
+        else:
+            # 우선 체력, 동률이면 점수
+            if p1.health == p2.health:
+                winner = "Draw" if p1.score == p2.score else ("Player 1" if p1.score > p2.score else "Player 2")
+            else:
+                winner = "Player 1" if p1.health > p2.health else "Player 2"
+            title = f"Winner: {winner}" if winner != "Draw" else "Draw"
         lines = [
             "Song complete!",
-            f"P1: {p1.score}    P2: {p2.score}",
-            f"Winner: {winner}",
+            f"P1 Score: {p1.score} | HP: {int(p1.health)}",
+            f"P2 Score: {p2.score} | HP: {int(p2.health)}",
+            title if self.play_mode == "endurance" or not both_alive else "Clear!",
             "B: restart | Esc: quit song | wait: menu",
         ]
         y = self.height // 2 - 70
@@ -891,6 +975,23 @@ class Game:
             rect = surf.get_rect(center=(self.width // 2, y))
             self.screen.blit(surf, rect)
             y += 44
+
+    def _draw_ko_overlay(self, winner_idx: Optional[int]) -> None:
+        overlay = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 200))
+        self.screen.blit(overlay, (0, 0))
+        winner_text = "Draw" if winner_idx is None else f"Player {winner_idx + 1} Wins!"
+        lines = [
+            "KO!",
+            winner_text,
+            "B: restart | Esc: quit song",
+        ]
+        y = self.height // 2 - 40
+        for line in lines:
+            surf = self.big_font.render(line, True, (240, 240, 240))
+            rect = surf.get_rect(center=(self.width // 2, y))
+            self.screen.blit(surf, rect)
+            y += 48
 
     def _wait_for_restart(self) -> None:
         waiting = True
